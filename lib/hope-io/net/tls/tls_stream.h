@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <iostream>
+
 #include "hope-io/net/stream.h"
 #include "hope-io/net/factory.h"
 #include "hope-io/net/tls/tls_init.h"

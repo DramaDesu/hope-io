@@ -49,6 +49,20 @@ namespace hope::io {
             read(val);
             return val;
         }
+
+        enum class e_read_result : uint8_t {
+            none = 0,
+            accept,
+            data,
+            data_eof,
+
+            error = 0xFF
+        };
+
+        virtual bool read_more() { return false; }
+
+        virtual e_read_result preprocess_read(const void* data, size_t& offset, size_t& length) { return e_read_result::data_eof; }
+        virtual void preprocess_write(const void*& data, size_t& length) {}
     };
 
     // TODO:: string_view
