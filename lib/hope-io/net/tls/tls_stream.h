@@ -25,6 +25,8 @@ namespace hope::io {
 
     class base_tls_stream : public stream {
     public:
+        explicit base_tls_stream() = default;
+
         explicit base_tls_stream(stream* tcp_stream)
             : m_tcp_stream(tcp_stream) {
             if (m_tcp_stream == nullptr) {

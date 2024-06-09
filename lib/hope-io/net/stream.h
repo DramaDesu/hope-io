@@ -9,10 +9,16 @@
 
 #include <memory>
 #include <cassert>
+#include <functional>
 #include <string>
 #include <type_traits>
 
 namespace hope::io {
+
+	enum class e_stream_t : uint8_t {
+        ordinary,
+        websockets
+	};
 
     class stream {
     public:
@@ -49,20 +55,6 @@ namespace hope::io {
             read(val);
             return val;
         }
-
-        enum class e_read_result : uint8_t {
-            none = 0,
-            accept,
-            data,
-            data_eof,
-
-            error = 0xFF
-        };
-
-        virtual bool read_more() { return false; }
-
-        virtual e_read_result preprocess_read(const void* data, size_t& offset, size_t& length) { return e_read_result::data_eof; }
-        virtual void preprocess_write(const void*& data, size_t& length) {}
     };
 
     // TODO:: string_view

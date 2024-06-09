@@ -6,6 +6,7 @@
  * this file. If not, please write to: bezborodoff.gleb@gmail.com, or visit : https://github.com/glensand/daedalus-proto-lib
  */
 
+#include <array>
 #include <format>
 #include <iostream>
 
@@ -157,7 +158,9 @@ namespace {
 
     class win_websockets_stream final : public hope::io::stream {
     public:
-        explicit win_websockets_stream(unsigned long long in_socket) {
+        explicit win_websockets_stream(hope::io::read_function_t in_read_function, hope::io::write_function_t in_write_function, unsigned long long in_socket) {
+            read_function = std::forward<hope::io::read_function_t>(in_read_function);
+            write_function = std::forward<hope::io::write_function_t>(in_write_function);
             m_socket = in_socket;
         }
 
@@ -218,17 +221,181 @@ namespace {
         }
         void disconnect() override {
             closesocket(m_socket);
-            read_state = e_read_result::none;
             m_socket = INVALID_SOCKET;
         }
-        void write(const void* data, std::size_t length) override {
-            assert(false && "Not implemented");
+
+        void send_handshake(std::string_view request) {
+            accept_handshake = false;
+
+            constexpr auto web_version = "HTTP/1.1";
+            constexpr auto socket_version = "13";
+
+            constexpr auto key_length = 0x10;
+
+            constexpr auto request_format =
+                "GET {} {}\r\n"
+                "Host: {}\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                "Sec-WebSocket-Key: {}\r\n"
+                "Sec-WebSocket-Version: {}\r\n"
+                "\r\n";
+
+            const auto generated_key = base64_encode(random_bytes(key_length));
+
+            generated_header = std::format(request_format, request, web_version, host, generated_key, socket_version);
+
+            write_function(generated_header.data(), generated_header.length());
         }
+
+        void try_to_accept_handshake() {
+
+            assert(!accept_handshake && "Already accepted");
+
+            char header_buffer[8192];
+            if (const auto read_bytes = read_function(header_buffer, sizeof(header_buffer)))
+            {
+                static auto&& split_headers = [](const std::string_view& in_value, char in_delimiter = '\n') {
+                    std::unordered_map<std::string_view, std::string_view> out_values;
+                    for (const auto value : std::views::split(in_value, in_delimiter)) {
+                        const std::string_view key_value(value.begin(), value.end());
+                        if (key_value.length() > 1) {
+                            const auto key_value_separator_index = key_value.find_first_of(':');
+                            if (key_value_separator_index != std::string_view::npos) {
+                                const auto value_source_offset = std::min<size_t>(key_value_separator_index + 2, key_value.length() - 1);
+
+                                const std::string_view result_key(key_value.data(), key_value_separator_index);
+                                const std::string_view result_value(key_value.data() + value_source_offset, key_value.length() - value_source_offset - 1);
+
+                                out_values.insert({ result_key, result_value });
+                            }
+                        }
+                    }
+                    return out_values;
+                };
+
+                static auto&& check_header_value = [](auto&& headers, auto&& key, auto&& value)
+                {
+                    auto&& it = headers.find(key);
+                    return it != headers.cend() && std::ranges::equal(it->second, value);
+                };
+
+                static auto&& check_header_has_value = [](auto&& headers, auto&& key)
+                {
+                    auto&& it = headers.find(key);
+                    return it != headers.cend() && !it->second.empty();
+                };
+
+                auto&& headers = split_headers(std::string_view(header_buffer, read_bytes));
+
+                using namespace std::literals;
+                if (!check_header_value(headers, "Connection"sv, "upgrade"sv)) {
+                    // TODO: Write something to log
+                    return;
+                }
+                if (!check_header_value(headers, "Upgrade"sv, "websocket"sv)) {
+                    // TODO: Write something to log
+                    return;
+                }
+                if (!check_header_has_value(headers, "Sec-WebSocket-Accept"sv)) {
+                    // TODO: Write something to log
+                    return;
+                }
+
+                accept_handshake = true;
+            }
+        }
+
+
+        void write(const void* data, std::size_t length) override {
+            const std::string_view request(static_cast<std::string_view::const_pointer>(data), length);
+            send_handshake(request);
+
+            try_to_accept_handshake();
+        }
+
         void read(void* data, std::size_t length) override {
             assert(false && "Not implemented");
         }
         void stream_in(std::string& buffer) override {
-            assert(false && "Not implemented");
+            assert(accept_handshake && "Need handshake to read data");
+
+            if (failed_opt_code) {
+	            return;
+            }
+
+            constexpr auto web_socket_header_bytes = 0x2;
+            std::uint8_t header_data[web_socket_header_bytes];
+            		
+			if (read_function(header_data, web_socket_header_bytes) < web_socket_header_bytes) {
+                // TODO: Add log or something
+                return;
+			}
+
+         	constexpr auto EOF_BIT = 0x80;
+         	constexpr auto OP_CODE_BIT = 0x0F;
+         	constexpr auto MASK_BIT = 0x80;
+         	constexpr auto SOURCE_LEN_BIT = 0x7F;
+
+			constexpr auto OPCODE_TEXT = 0x1;
+
+			const std::uint8_t is_eof = header_data[0] & EOF_BIT;
+			const std::uint8_t op_code = header_data[0] & OP_CODE_BIT;
+			const std::uint8_t mask = header_data[1] & MASK_BIT;
+
+			if (op_code != OPCODE_TEXT)
+			{
+                // TODO: Add log or something
+                failed_opt_code = true;
+                return;
+			}
+
+			static auto&& read_package_length = [&](size_t& out_package_length) {
+
+				out_package_length = header_data[1] & SOURCE_LEN_BIT;
+
+				std::uint8_t extra_length_bytes = 0;
+				const std::uint8_t package_length = header_data[1] & SOURCE_LEN_BIT;
+				if (package_length == 126u) {
+					extra_length_bytes = 0x2;
+				}
+				else if (package_length == 127u) {
+					extra_length_bytes = 0x8;
+				}
+
+				if (extra_length_bytes > 0) {
+					std::vector<std::uint8_t> data_length_buffer(extra_length_bytes);
+                    if (read_function(data_length_buffer.data(), data_length_buffer.size()) != data_length_buffer.size()) {
+	                    return false;
+                    }
+
+					out_package_length = 0ull;
+					for (auto&& i = 0; i < extra_length_bytes; i++) {
+						out_package_length = (out_package_length << 0x8) + data_length_buffer[i];
+					}
+				}
+				else {
+					out_package_length = package_length;
+				}
+
+				return true;
+			};
+
+            size_t package_length;
+            if (!read_package_length(package_length)) {
+                // TODO: Add log or something
+	            return;
+            }
+
+            std::array<char, 1024> read_buffer;
+            while (package_length > 0) {
+	            const size_t read_chunk = std::min<size_t>(package_length, read_buffer.size());
+                const size_t read_bytes = read_function(read_buffer.data(), read_chunk);
+
+                buffer.append(read_buffer.data(), read_bytes);
+
+                package_length = package_length < read_bytes ? 0 : package_length - read_bytes;
+            }
         }
 
         [[nodiscard]] std::string get_endpoint() const override {
@@ -276,154 +443,14 @@ namespace {
             return encoded;
         }
 
-        virtual void preprocess_write(const void*& data, size_t& length) override {
-			const std::string_view request(static_cast<std::string_view::const_pointer>(data), length);
-
-			constexpr auto web_version = "HTTP/1.1";
-			constexpr auto socket_version = "13";
-
-			constexpr auto key_length = 0x10;
-
-            constexpr auto request_format =
-                "GET {} {}\r\n"
-                "Host: {}\r\n"
-                "Upgrade: websocket\r\n"
-                "Connection: Upgrade\r\n"
-                "Sec-WebSocket-Key: {}\r\n"
-                "Sec-WebSocket-Version: {}\r\n"
-                "\r\n";
-
-            const auto generated_key = base64_encode(random_bytes(key_length));
-
-            header = std::format(request_format, request, web_version, host, generated_key, socket_version);
-
-            data = header.data();
-            length = header.length();
-        }
-
-        virtual bool read_more() override {
-			if (read_state != e_read_result::data_eof) {
-				return false;
-			}
-            read_state = e_read_result::accept;
-	        return true;
-        }
-
-        virtual e_read_result preprocess_read(const void* data, size_t& offset, size_t& length) override {
-			// TODO: Check if length == 0
-            const std::string_view buffer(static_cast<std::string_view::const_pointer>(data), length);
-
-        	static auto&& split_headers = [](const std::string_view& in_value, char in_delimiter = '\n') {
-                std::vector<std::string_view> out_values;
-                for (const auto value : std::views::split(in_value, in_delimiter)) {
-                    out_values.emplace_back(value.begin(), value.end());
-                }
-                return out_values;
-            };
-
-			switch (read_state) {
-				case e_read_result::none: {
-                    auto&& headers = split_headers(buffer);
-                    for (auto&& header_view : headers) {
-                        if (header_view.length() == 1 && header_view == "\r") {
-                            read_state = e_read_result::accept;
-                            return e_read_result::accept;
-                        }
-                    }
-                    read_state = e_read_result::error;
-					break;
-				}
-                case e_read_result::accept: {
-					constexpr auto web_socket_header_bytes = 0x2;
-					if (length < web_socket_header_bytes) {
-                        return e_read_result::error;
-					}
-
-					constexpr auto EOF_BIT = 0x80;
-					constexpr auto OP_CODE_BIT = 0x0F;
-					constexpr auto MASK_BIT = 0x80;
-					constexpr auto SOURCE_LEN_BIT = 0x7F;
-
-                    constexpr auto OPCODE_TEXT = 0x1;
-
-                    const std::uint8_t* data_ptr = static_cast<const std::uint8_t*>(data);
-
-                    const std::uint8_t is_eof = data_ptr[0] & EOF_BIT;
-                    const std::uint8_t op_code = data_ptr[0] & OP_CODE_BIT;
-                    const std::uint8_t mask = data_ptr[1] & MASK_BIT;
-
-                    if (op_code != OPCODE_TEXT)
-                    {
-                        return e_read_result::error;
-                    }
-
-                    static auto&& read_package_length = [&](size_t& out_package_length) {
-
-                        out_package_length = data_ptr[1] & SOURCE_LEN_BIT;
-
-                        std::uint8_t extra_length_bytes = 0;
-                        const std::uint8_t package_length = data_ptr[1] & SOURCE_LEN_BIT;
-                        if (package_length == 126u) {
-                            extra_length_bytes = 0x2;
-                        }
-                        else if (package_length == 127u) {
-                            extra_length_bytes = 0x8;
-                        }
-
-                        if (length < web_socket_header_bytes + extra_length_bytes) {
-	                        return false;
-                        }
-
-                        if (extra_length_bytes > 0) {
-                            const std::uint8_t* data_length_ptr = data_ptr + web_socket_header_bytes;
-
-                            out_package_length = 0ull;
-                            for (auto&& i = 0; i < extra_length_bytes; i++) {
-                                out_package_length = (out_package_length << 0x8) + data_length_ptr[i];
-                            }
-                        }
-                        else {
-							out_package_length = package_length;
-                        }
-
-                        offset += extra_length_bytes;
-                        return true;
-                    };
-
-                    offset = web_socket_header_bytes;
-
-                    size_t package_length;
-					if (!read_package_length(package_length))
-					{
-                        return e_read_result::error;
-					}
-
-                    if (package_length + 0x4 != length)
-                    {
-                        return e_read_result::error;
-                    }
-
-                    length = package_length;
-
-					// TODO: Process large messages
-					return is_eof ? e_read_result::data_eof : e_read_result::data;
-				}
-
-                case e_read_result::data:
-				case e_read_result::data_eof:
-					return e_read_result::data_eof;
-
-                case e_read_result::error: break;
-			}
-
-        	return e_read_result::error;
-        }
-
         std::string host;
-        std::string header;
+        std::string generated_header;
 
-        // TODO: Might better to use not common enum, better to use inner states of websocket (connected, handshake, header, closed)
-        e_read_result read_state = e_read_result::none;
+        hope::io::read_function_t read_function;
+        hope::io::write_function_t write_function;
+
+        bool failed_opt_code = false;
+        bool accept_handshake = false;
 
         SOCKET m_socket{ INVALID_SOCKET };
     };
@@ -432,8 +459,11 @@ namespace {
 namespace hope::io {
 
     stream* create_stream(unsigned long long socket) {
-        // return new win_stream(socket);
-        return new win_websockets_stream(socket);
+        return new win_stream(socket);
+    }
+
+    stream* create_stream(read_function_t&& in_read_function, write_function_t&& in_write_function, unsigned long long socket) {
+        return new win_websockets_stream(std::forward<read_function_t>(in_read_function), std::forward<write_function_t>(in_write_function), socket);
     }
 
 }
