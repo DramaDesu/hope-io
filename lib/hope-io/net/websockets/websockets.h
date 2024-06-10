@@ -7,6 +7,7 @@
 #include <string>
 
 namespace hope::io {
+	std::string generate_handshake(const std::string& host, const std::string& uri);
 }
 
 
